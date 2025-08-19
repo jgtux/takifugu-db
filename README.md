@@ -27,7 +27,7 @@ Minimalist and secure db made in C made for OpenBSD (WIP)
 ----
 
 - Simple CRUD
-- Mini-UUID type
+- Compact-UUID type
 - ChaCha20-Poly1305 encrypted packet transmission 
 - Key based authentication
 - Lightweight protocol
