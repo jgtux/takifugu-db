@@ -23,8 +23,6 @@ Minimalist and secure db made in C made for OpenBSD (WIP)
  |_________|/
 
 
-
-
 ```
 ----
 
