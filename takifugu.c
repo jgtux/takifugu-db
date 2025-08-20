@@ -57,7 +57,6 @@ typedef struct database {
 
 typedef struct comp_uuid {
   unsigned char *raw;
-  uint32_t fourbyte_timestamp;
 } comp_uuid_t;
 
 // type size
@@ -185,6 +184,10 @@ static inline void setDouble(row_t *row, size_t idx, double val) {
 static void setStr(row_t *row, size_t idx, const char *str) {
   size_t len = strlen(str) + 1;
 
+  if (row->values[idx].ptr) {
+    free(row->values[idx].ptr);
+  }
+
   row->values[idx].ptr = malloc(len);
 
   memcpy(row->values[idx].ptr, str, len);
@@ -192,8 +195,19 @@ static void setStr(row_t *row, size_t idx, const char *str) {
   row->values[idx].size = len;
 }
 
-static inline void setCompactUUID(row_t *row, size_t idx, comp_uuid_t *val) {
-  *((comp_uuid_t*)row->values[idx].ptr) = *val;
+static void setCompactUUID(row_t *row, size_t idx, comp_uuid_t *val) {
+  if (!row->values[idx].ptr) {
+    row->values[idx].ptr = malloc(sizeof(comp_uuid_t));
+  }
+
+  comp_uuid_t *dest = (comp_uuid_t *)row->values[idx].ptr;
+
+  if (dest->raw) {
+    free(dest->raw);
+  }
+  
+  dest->raw = malloc(COMPUUID_LEN);
+  memcpy(dest->raw, val->raw, COMPUUID_LEN);
 }
 
 static comp_uuid_t *generateCompUUID(void) {
@@ -208,7 +222,6 @@ static comp_uuid_t *generateCompUUID(void) {
 
   // timestamp
   uint32_t ts = (uint32_t)time(NULL);
-  c_uuid->fourbyte_timestamp = ts;
   uint32_t be_ts = htonl(ts);
   memcpy(c_uuid->raw, &be_ts, 4); 
   // version
