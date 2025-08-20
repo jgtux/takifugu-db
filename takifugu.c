@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <time.h>
 #include <string.h>
 #include <arpa/inet.h>
 
@@ -19,7 +20,7 @@ typedef enum {
   COL_STRICT_STR,
   COL_BOOL,
   COL_BYTE,
-  COL_CUUID
+  COL_CO_UUID
 } col_type;
 
 typedef struct column {
@@ -55,7 +56,7 @@ typedef struct database {
 } db_t;
 
 typedef struct comp_uuid {
-  const unsigned char *raw;
+  unsigned char *raw;
   uint32_t fourbyte_timestamp;
 } comp_uuid_t;
 
@@ -70,7 +71,7 @@ static inline size_t type_size(col_type type, size_t len) {
   case COL_STRICT_STR: return len;
   case COL_BOOL: return sizeof(bool);
   case COL_BYTE: return sizeof(unsigned char);
-  case COL_CO_UUID: return sizeof(comp_uuid_v1_t);
+  case COL_CO_UUID: return sizeof(comp_uuid_t);
   case COL_STR: return 0;
   default: return 0;
   }
