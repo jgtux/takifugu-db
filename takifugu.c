@@ -9,6 +9,9 @@
 #define COMPUUID_LEN 16
 #define COMPUUID_VERSION 0x01
 
+/* ----------------------------------------------------------------------------- */
+
+// data structs
 
 typedef enum {
   COL_INT,
@@ -50,7 +53,7 @@ typedef struct table {
 
 typedef struct database {
   char *name;
-  table_t **tables;
+  table_t *tables;
   size_t tbls_len;
   size_t table_cap;
 } db_t;
@@ -58,6 +61,8 @@ typedef struct database {
 typedef struct comp_uuid {
   unsigned char *raw;
 } comp_uuid_t;
+
+/* ----------------------------------------------------------------------------- */
 
 // type size
 static inline size_t type_size(col_type type, size_t len) {
@@ -76,6 +81,29 @@ static inline size_t type_size(col_type type, size_t len) {
   }
 }
 
+/* ----------------------------------------------------------------------------- */
+
+static void freeCell(col_type type, column_val_t *cell) {
+  if (!cell || !cell->ptr) return;
+
+  if (type == COL_CO_UUID) {
+    comp_uuid_t *c = (comp_uuid_t*)cell->ptr;
+    if (c) {
+      if (c->raw) free(c->raw);
+      free(c);
+    }
+  } else {
+    free(cell->ptr); 
+  }
+
+  cell->ptr = NULL;
+  cell->size = 0;
+}
+
+static void freeRow(table_t *tb, row_t *row) {}
+
+/* ----------------------------------------------------------------------------- */
+
 // create database 
 static db_t *createDatabase(const char *name, size_t init_table_cap) {
   db_t *db = malloc(sizeof(db_t));
@@ -91,6 +119,8 @@ static db_t *createDatabase(const char *name, size_t init_table_cap) {
   }
   return db;
 }
+
+/* ----------------------------------------------------------------------------- */
 
 // create table 
 static table_t *createTable(column_t *columns, size_t col_len, size_t init_row_cap) {
@@ -112,32 +142,7 @@ static table_t *createTable(column_t *columns, size_t col_len, size_t init_row_c
   return tb;
 }
 
-// insert row 
-static int insertTable(table_t *tb, row_t row) {
-  if (row.len != tb->cols_len) return -1;
-
-  // type/size check
-  for (size_t i = 0; i < tb->cols_len; i++) {
-    column_t *col = &tb->columns[i];
-    column_val_t *val = &row.values[i];
-    size_t expected = type_size(col->type, col->len);
-    if (expected > 0 && val->size != expected) return -2;
-    if ((col->type == COL_STR || col->type == COL_STRICT_STR) &&
-        !col->nullable && val->ptr == NULL) return -3;
-  }
-
-  // grow rows if needed
-  if (tb->rows_len >= tb->row_cap) {
-    size_t new_cap = tb->row_cap ? tb->row_cap * 2 : 4;
-    row_t *new_rows = realloc(tb->rows, new_cap * sizeof(row_t));
-    if (!new_rows) return -4;
-    tb->rows = new_rows;
-    tb->row_cap = new_cap;
-  }
-
-  tb->rows[tb->rows_len++] = row;
-  return 0;
-}
+/* ----------------------------------------------------------------------------- */
 
 //create empty row
 static row_t createEmptyRow(table_t *tb) {
@@ -156,31 +161,69 @@ static row_t createEmptyRow(table_t *tb) {
   return row;
 }
 
-// setters
+// insert row
+static int insertRow(table_t *tb, row_t row) {
+  if (row.len != tb->cols_len) return -1;
+
+  for (size_t i = 0; i < tb->cols_len; i++) {
+    column_t *col = &tb->columns[i];
+    column_val_t *val = &row.values[i];
+    size_t expected = type_size(col->type, col->len);
+    if (expected > 0 && val->size != expected) return -2;
+    if ((col->type == COL_STR || col->type == COL_STRICT_STR) &&
+        !col->nullable && val->ptr == NULL) return -3;
+  }
+
+  if (tb->rows_len >= tb->row_cap) {
+    size_t new_cap = tb->row_cap ? tb->row_cap * 2 : 4;
+    row_t *new_rows = realloc(tb->rows, new_cap * sizeof(row_t));
+    if (!new_rows) return -4;
+    tb->rows = new_rows;
+    tb->row_cap = new_cap;
+  }
+
+  tb->rows[tb->rows_len++] = row;
+  return 0;
+}
+
+// delete row
+static int deleteRow(table_t *t, row_t row) {
+
+}
+
+/* ----------------------------------------------------------------------------- */
+
+// set int val
 static inline void setInt(row_t *row, size_t idx, int val) {
   *((int*)row->values[idx].ptr) = val;
 }
 
+// set int64 val
 static inline void setInt64(row_t *row, size_t idx, int64_t val) {
   *((int64_t*)row->values[idx].ptr) = val;
 }
 
+// set uint val
 static inline void setUint(row_t *row, size_t idx, uint32_t val) {
   *((uint32_t*)row->values[idx].ptr) = val;
 }
 
+// set uint64 val
 static inline void setUint64(row_t *row, size_t idx, uint64_t val) {
   *((uint64_t*)row->values[idx].ptr) = val;  
 }
 
+// set bool val
 static inline void setBool(row_t *row, size_t idx, bool val) {
   *((bool*)row->values[idx].ptr) = val;
 }
 
+// set double val
 static inline void setDouble(row_t *row, size_t idx, double val) {
   *((double*)row->values[idx].ptr) = val;
 }
 
+// set string val
 static void setStr(row_t *row, size_t idx, const char *str) {
   size_t len = strlen(str) + 1;
 
@@ -195,6 +238,7 @@ static void setStr(row_t *row, size_t idx, const char *str) {
   row->values[idx].size = len;
 }
 
+// set compact-uuid val
 static void setCompactUUID(row_t *row, size_t idx, comp_uuid_t *val) {
   if (!row->values[idx].ptr) {
     row->values[idx].ptr = malloc(sizeof(comp_uuid_t));
@@ -210,6 +254,9 @@ static void setCompactUUID(row_t *row, size_t idx, comp_uuid_t *val) {
   memcpy(dest->raw, val->raw, COMPUUID_LEN);
 }
 
+/* ----------------------------------------------------------------------------- */
+
+// comp UUID generator
 static comp_uuid_t *generateCompUUID(void) {
   comp_uuid_t *c_uuid = malloc(sizeof(comp_uuid_t));
   if (!c_uuid) return NULL;
@@ -235,6 +282,8 @@ static comp_uuid_t *generateCompUUID(void) {
   return c_uuid;
 }
 
+/* ----------------------------------------------------------------------------- */
+
 // main
 int main() {
   column_t cols[2];
@@ -246,7 +295,7 @@ int main() {
   setInt(&r, 0, 42);
   setStr(&r, 1, "Alice");
 
-  insertTable(tb, r);
+  insertRow(tb, r);
 
   printf("Row inserted: id=%d, name=%s\n",
          *((int*)tb->rows[0].values[0].ptr),
