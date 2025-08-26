@@ -14,6 +14,16 @@
 
 // data structs
 
+// error handling
+typedef enum {
+  DB_SUCCESS = 0,
+  DB_ERROR_NULL_PARAM = -1,
+  DB_ERROR_OUT_OF_MEMORY = -2,
+  DB_ERROR_TABLE_NOT_FOUND = -3,
+  DB_ERROR_COLUMN_MISMATCH = -4,
+  DB_ERROR_DUPLICATE_NAME = -5
+} int_return_type;
+
 typedef enum {
   COL_INT,
   COL_INT64,
