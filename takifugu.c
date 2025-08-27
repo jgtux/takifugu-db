@@ -6,9 +6,11 @@
 #include <string.h>
 #include <arpa/inet.h>
 #include <inttypes.h>
+#include <unistd.h>
+#include <sys/time.h>
 
-#define COMPUUID_LEN 16
-#define COMPUUID_VERSION 0x01
+#define FUGUID_LEN 12
+#define FUGUID_VERSION 0x01
 
 typedef enum {
   DB_SUCCESS = 0,
@@ -30,7 +32,7 @@ typedef enum {
   COL_STRICT_STR,
   COL_BOOL,
   COL_BYTE,
-  COL_CO_UUID
+  COL_FUGU_ID
 } col_type;
 
 typedef struct column {
@@ -66,9 +68,13 @@ typedef struct database {
   size_t table_cap;
 } db_t;
 
-typedef struct comp_uuid {
-  unsigned char *raw;
-} comp_uuid_t;
+typedef struct fugu_id {
+  unsigned char data[FUGUID_LEN];
+} fugu_id_t;
+
+// Global counter for sequence numbers (thread-safe would need mutex in real implementation)
+static uint32_t g_sequence_counter = 0;
+static uint32_t g_process_id = 0;
 
 static inline size_t type_size(col_type type, size_t len) {
   switch(type) {
@@ -80,7 +86,7 @@ static inline size_t type_size(col_type type, size_t len) {
   case COL_STRICT_STR: return len;
   case COL_BOOL: return sizeof(bool);
   case COL_BYTE: return sizeof(unsigned char);
-  case COL_CO_UUID: return sizeof(comp_uuid_t);
+  case COL_FUGU_ID: return sizeof(fugu_id_t);
   case COL_STR: return 0;
   default: return 0;
   }
@@ -94,18 +100,8 @@ static void freeCell(col_type type, column_val_t *cell) {
     return;
   }
 
-  if (type == COL_CO_UUID) {
-    comp_uuid_t *c = cell->ptr;
-    if (c) {
-      if (c->raw) {
-        free(c->raw);
-      }
-      free(c);
-    }
-  } else {
-    free(cell->ptr); 
-  }
-
+  // FuguID is now a simple struct, no nested allocation needed
+  free(cell->ptr); 
   cell->ptr = NULL;
   cell->size = 0;
 }
@@ -361,10 +357,10 @@ static int insertRowSafe(table_t *tb, row_t row) {
     }
     
     switch (col->type) {
-      case COL_CO_UUID: {
-        comp_uuid_t *uuid = (comp_uuid_t*)val->ptr;
-        if (!uuid || !uuid->raw) {
-          return DB_ERROR_NULL_PARAM;
+      case COL_FUGU_ID: {
+        // Simple validation - just check it's the right size
+        if (val->size != sizeof(fugu_id_t)) {
+          return DB_ERROR_COLUMN_MISMATCH;
         }
         break;
       }
@@ -467,24 +463,10 @@ static void setStr(row_t *row, size_t idx, const char *str) {
   row->values[idx].size = len;
 }
 
-static void setCompactUUID(row_t *row, size_t idx, comp_uuid_t *val) {
-  if (idx >= row->len || !val) return;
+static void setFuguID(row_t *row, size_t idx, const fugu_id_t *val) {
+  if (idx >= row->len || !val || !row->values[idx].ptr) return;
   
-  if (!row->values[idx].ptr) {
-    row->values[idx].ptr = malloc(sizeof(comp_uuid_t));
-    if (!row->values[idx].ptr) return;
-  }
-
-  comp_uuid_t *dest = (comp_uuid_t *)row->values[idx].ptr;
-
-  if (dest->raw) {
-    free(dest->raw);
-  }
-  
-  dest->raw = malloc(COMPUUID_LEN);
-  if (!dest->raw) return;
-  
-  memcpy(dest->raw, val->raw, COMPUUID_LEN);
+  memcpy(row->values[idx].ptr, val, sizeof(fugu_id_t));
 }
 
 static int getInt(const row_t *row, size_t idx, int *out) {
@@ -551,55 +533,112 @@ static int getString(const row_t *row, size_t idx, char **out) {
   return DB_SUCCESS;
 }
 
-static int getCompactUUID(const row_t *row, size_t idx, comp_uuid_t **out) {
+static int getFuguID(const row_t *row, size_t idx, fugu_id_t **out) {
   if (!row || !out || idx >= row->len || !row->values[idx].ptr) {
     return DB_ERROR_NULL_PARAM;
   }
-  *out = (comp_uuid_t*)row->values[idx].ptr;
+  *out = (fugu_id_t*)row->values[idx].ptr;
   return DB_SUCCESS;
 }
 
-static comp_uuid_t *generateCompUUID(void) {
-  comp_uuid_t *c_uuid = malloc(sizeof(comp_uuid_t));
-  if (!c_uuid) return NULL;
-
-  c_uuid->raw = malloc(COMPUUID_LEN);
-  if (!c_uuid->raw) {
-    free(c_uuid);
-    return NULL;
+// Initialize the FuguID generator
+static void initFuguIDGenerator(void) {
+  if (g_process_id == 0) {
+    g_process_id = (uint32_t)getpid();
+    srand((unsigned int)time(NULL) ^ g_process_id);
   }
-
-  uint32_t ts = (uint32_t)time(NULL);
-  uint32_t be_ts = htonl(ts);
-  memcpy(c_uuid->raw, &be_ts, 4); 
-  c_uuid->raw[4] = COMPUUID_VERSION;
-
-  for (int i = 0; i < 11; i++) {
-    c_uuid->raw[5 + i] = (unsigned char)(arc4random() & 0xFF);
-  }
-
-  return c_uuid;
 }
 
-static void printCompactUUID(comp_uuid_t *uuid) {
-  if (!uuid || !uuid->raw) {
+// Fast, simple random number generator using linear congruential generator
+static uint32_t fastRandom(void) {
+  static uint32_t seed = 1;
+  seed = seed * 1664525 + 1013904223;
+  return seed;
+}
+
+static fugu_id_t generateFuguID(void) {
+  fugu_id_t id;
+  
+  // Initialize generator if needed
+  initFuguIDGenerator();
+  
+  // Get high-resolution timestamp (microseconds since epoch)
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  uint64_t timestamp = (uint64_t)tv.tv_sec * 1000000 + tv.tv_usec;
+  
+  // Layout: [6 bytes timestamp][2 bytes process_id][3 bytes sequence][1 byte version]
+  
+  // First 6 bytes: timestamp (big endian, truncated to 48 bits)
+  for (int i = 5; i >= 0; i--) {
+    id.data[i] = (unsigned char)(timestamp & 0xFF);
+    timestamp >>= 8;
+  }
+  
+  // Next 2 bytes: process ID (big endian, truncated to 16 bits)
+  uint16_t pid = (uint16_t)(g_process_id & 0xFFFF);
+  id.data[6] = (unsigned char)(pid >> 8);
+  id.data[7] = (unsigned char)(pid & 0xFF);
+  
+  // Next 3 bytes: sequence counter + random bits for safety
+  uint32_t seq = ++g_sequence_counter;
+  uint32_t random_mix = fastRandom();
+  seq = (seq & 0xFFF) | ((random_mix & 0xFFF) << 12); // 12 bits seq + 12 bits random
+  
+  id.data[8] = (unsigned char)(seq >> 16);
+  id.data[9] = (unsigned char)(seq >> 8);
+  id.data[10] = (unsigned char)(seq & 0xFF);
+  
+  // Last byte: version
+  id.data[11] = FUGUID_VERSION;
+  
+  return id;
+}
+
+static void printFuguID(const fugu_id_t *id) {
+  if (!id) {
     printf("NULL");
     return;
   }
   
-  uint32_t ts_be;
-  memcpy(&ts_be, uuid->raw, 4);
-  uint32_t timestamp = ntohl(ts_be);
-  
-  printf("%08x-%02x-", timestamp, uuid->raw[4]);
-  for (int i = 5; i < COMPUUID_LEN; i++) {
-    printf("%02x", uuid->raw[i]);
-    if (i == 7 || i == 9) printf("-");
+  // Extract timestamp (first 6 bytes)
+  uint64_t timestamp = 0;
+  for (int i = 0; i < 6; i++) {
+    timestamp = (timestamp << 8) | id->data[i];
   }
+  
+  // Extract process ID (next 2 bytes)
+  uint16_t pid = (id->data[6] << 8) | id->data[7];
+  
+  // Extract sequence (next 3 bytes)
+  uint32_t seq = (id->data[8] << 16) | (id->data[9] << 8) | id->data[10];
+  
+  // Format as readable string
+  printf("fugu:%012" PRIx64 "-%04x-%06x-%02x", timestamp, pid, seq, id->data[11]);
+}
+
+// Compare FuguIDs for sorting/searching (lexicographic order gives chronological order)
+static int compareFuguID(const fugu_id_t *a, const fugu_id_t *b) {
+  if (!a && !b) return 0;
+  if (!a) return -1;
+  if (!b) return 1;
+  
+  return memcmp(a->data, b->data, FUGUID_LEN);
+}
+
+// Extract timestamp from FuguID
+static uint64_t extractFuguIDTimestamp(const fugu_id_t *id) {
+  if (!id) return 0;
+  
+  uint64_t timestamp = 0;
+  for (int i = 0; i < 6; i++) {
+    timestamp = (timestamp << 8) | id->data[i];
+  }
+  return timestamp;
 }
 
 int main() {
-  printf("=== Testing In-Memory Database with Compact-UUID ===\n\n");
+  printf("=== Testing In-Memory Database with FuguID ===\n\n");
   
   db_t *db = createDatabase("test_db", 4);
   if (!db) {
@@ -611,7 +650,7 @@ int main() {
   column_t cols[6];
   
   cols[0].name = strdup("id");
-  cols[0].type = COL_CO_UUID;
+  cols[0].type = COL_FUGU_ID;
   cols[0].nullable = false;
   cols[0].len = 0;
   
@@ -656,13 +695,9 @@ int main() {
   printf("\n--- Test 1: Inserting valid rows ---\n");
   
   row_t r1 = createEmptyRow(tb);
-  comp_uuid_t *uuid1 = generateCompUUID();
-  if (!uuid1) {
-    printf("Failed to generate UUID\n");
-    goto cleanup;
-  }
+  fugu_id_t id1 = generateFuguID();
   
-  setCompactUUID(&r1, 0, uuid1);
+  setFuguID(&r1, 0, &id1);
   setInt(&r1, 1, 1001);
   setStr(&r1, 2, "Alice Johnson");
   setBool(&r1, 3, true);
@@ -677,13 +712,9 @@ int main() {
   }
 
   row_t r2 = createEmptyRow(tb);
-  comp_uuid_t *uuid2 = generateCompUUID();
-  if (!uuid2) {
-    printf("Failed to generate UUID\n");
-    goto cleanup;
-  }
+  fugu_id_t id2 = generateFuguID();
   
-  setCompactUUID(&r2, 0, uuid2);
+  setFuguID(&r2, 0, &id2);
   setInt(&r2, 1, 1002);
   setStr(&r2, 2, "Bob Smith");
   setByte(&r2, 5, 15);
@@ -696,13 +727,9 @@ int main() {
   }
 
   row_t r3 = createEmptyRow(tb);
-  comp_uuid_t *uuid3 = generateCompUUID();
-  if (!uuid3) {
-    printf("Failed to generate UUID\n");
-    goto cleanup;
-  }
+  fugu_id_t id3 = generateFuguID();
   
-  setCompactUUID(&r3, 0, uuid3);
+  setFuguID(&r3, 0, &id3);
   setInt(&r3, 1, 1003);
   setStr(&r3, 2, "Charlie Brown");
   setBool(&r3, 3, false);
@@ -718,24 +745,22 @@ int main() {
 
   printf("\n--- Test 2: Testing validation ---\n");
   row_t r4 = createEmptyRow(tb);
-  comp_uuid_t *uuid4 = generateCompUUID();
-  if (uuid4) {
-    setCompactUUID(&r4, 0, uuid4);
-    setInt(&r4, 1, 1004);
-    setBool(&r4, 3, true);
-    setByte(&r4, 5, 10);
-    
-    result = insertRowSafe(tb, r4);
-    if (result != DB_SUCCESS) {
-      printf("✓ Correctly rejected row with missing required field (error: %d)\n", result);
-    } else {
-      printf("✗ Should have rejected invalid row\n");
-    }
-    
-    freeRowContents(tb, &r4);
-    free(uuid4->raw);
-    free(uuid4);
+  fugu_id_t id4 = generateFuguID();
+  
+  setFuguID(&r4, 0, &id4);
+  setInt(&r4, 1, 1004);
+  setBool(&r4, 3, true);
+  setByte(&r4, 5, 10);
+  // Missing required name field
+  
+  result = insertRowSafe(tb, r4);
+  if (result != DB_SUCCESS) {
+    printf("✓ Correctly rejected row with missing required field (error: %d)\n", result);
+  } else {
+    printf("✗ Should have rejected invalid row\n");
   }
+  
+  freeRowContents(tb, &r4);
 
   printf("\n--- Database Contents ---\n");
   printf("Database: %s\n", db->name);
@@ -749,11 +774,11 @@ int main() {
   for (size_t r = 0; r < tb->rows_len; r++) {
     printf("Row %zu:\n", r + 1);
     
-    comp_uuid_t *uuid;
-    if (getCompactUUID(&tb->rows[r], 0, &uuid) == 0) {
+    fugu_id_t *fugu_id;
+    if (getFuguID(&tb->rows[r], 0, &fugu_id) == 0) {
       printf("  ID: ");
-      printCompactUUID(uuid);
-      printf("\n");
+      printFuguID(fugu_id);
+      printf(" (timestamp: %" PRIu64 ")\n", extractFuguIDTimestamp(fugu_id));
     }
     
     int user_id;
@@ -795,12 +820,11 @@ int main() {
   printf("--- Performance Test ---\n");
   clock_t start = clock();
   
-  for (int i = 0; i < 1000; i++) {
+  for (int i = 0; i < 10000; i++) {
     row_t perf_row = createEmptyRow(tb);
-    comp_uuid_t *perf_uuid = generateCompUUID();
-    if (!perf_uuid) break;
+    fugu_id_t perf_id = generateFuguID();
     
-    setCompactUUID(&perf_row, 0, perf_uuid);
+    setFuguID(&perf_row, 0, &perf_id);
     setInt(&perf_row, 1, 2000 + i);
     
     char temp_name[50];
@@ -812,18 +836,53 @@ int main() {
     
     if (insertRowSafe(tb, perf_row) != DB_SUCCESS) {
       freeRowContents(tb, &perf_row);
-      free(perf_uuid->raw);
-      free(perf_uuid);
       break;
     }
-    free(perf_uuid->raw);
-    free(perf_uuid);
   }
   
   clock_t end = clock();
   double cpu_time = ((double)(end - start)) / CLOCKS_PER_SEC;
-  printf("✓ Inserted 1000 additional rows in %.3f seconds\n", cpu_time);
+  printf("✓ Inserted 10,000 additional rows in %.3f seconds\n", cpu_time);
   printf("✓ Total rows: %zu\n", tb->rows_len);
+  printf("✓ Average: %.0f insertions/second\n", 10000.0 / cpu_time);
+
+  printf("\n--- FuguID Properties Test ---\n");
+  
+  // Test chronological ordering
+  fugu_id_t early_id = generateFuguID();
+  usleep(1000); // 1ms delay
+  fugu_id_t later_id = generateFuguID();
+  
+  printf("✓ Early ID: ");
+  printFuguID(&early_id);
+  printf("\n✓ Later ID: ");
+  printFuguID(&later_id);
+  printf("\n");
+  
+  int cmp = compareFuguID(&early_id, &later_id);
+  if (cmp < 0) {
+    printf("✓ FuguIDs maintain chronological order\n");
+  } else {
+    printf("✗ FuguID ordering issue\n");
+  }
+  
+  // Test bulk generation performance
+  printf("\n--- Bulk ID Generation Test ---\n");
+  start = clock();
+  for (int i = 0; i < 100000; i++) {
+    fugu_id_t temp_id = generateFuguID();
+    (void)temp_id; // Suppress unused variable warning
+  }
+  end = clock();
+  cpu_time = ((double)(end - start)) / CLOCKS_PER_SEC;
+  printf("✓ Generated 100,000 FuguIDs in %.3f seconds\n", cpu_time);
+  printf("✓ Average: %.0f generations/second\n", 100000.0 / cpu_time);
+  
+  // Show memory efficiency
+  printf("\n--- Memory Usage Analysis ---\n");
+  printf("✓ FuguID size: %zu bytes (vs UUID4: 16 bytes)\n", sizeof(fugu_id_t));
+  printf("✓ FuguID is %zu bytes smaller than UUID4\n", 16 - sizeof(fugu_id_t));
+  printf("✓ Memory savings for 10,000 records: %zu bytes\n", (16 - sizeof(fugu_id_t)) * tb->rows_len);
 
 cleanup:
   for (int i = 0; i < 6; i++) {
@@ -832,12 +891,16 @@ cleanup:
     }
   }
 
-  if (uuid1) { free(uuid1->raw); free(uuid1); }
-  if (uuid2) { free(uuid2->raw); free(uuid2); }
-  if (uuid3) { free(uuid3->raw); free(uuid3); }
-
   freeDatabase(db);
   
-  printf("\n=== Test completed successfully ===\n");
+  printf("\n=== FuguID Database Test completed successfully ===\n");
+  printf("\nFuguID Advantages over UUID4:\n");
+  printf("• 25%% smaller (12 bytes vs 16 bytes)\n");
+  printf("• Naturally chronologically sortable\n");
+  printf("• No cryptographic randomness required (faster generation)\n");
+  printf("• Embeds timestamp for debugging and analysis\n");
+  printf("• Process-aware for multi-process safety\n");
+  printf("• Sequence counter prevents duplicates within same microsecond\n");
+  
   return 0;
 }
