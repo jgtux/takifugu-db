@@ -128,7 +128,7 @@ static void freeTableContents(table_t *tb) {
     return;
 
   if (tb->rows && tb->rows_len > 0) {
-    for (size_t i = 0; i < tb->rows_len && i < cols_len; i++) {
+    for (size_t i = 0; i < tb->rows_len && i < tb->cols_len; i++) {
       freeRowContents(tb, &tb->rows[i]);
     }
   }
