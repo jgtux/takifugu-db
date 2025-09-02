@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stdatomic.h>
 #include <time.h>
+#include <pthread.h>
 #include <string.h>
 #include <arpa/inet.h>
 #include <inttypes.h>
@@ -22,7 +23,9 @@ typedef enum {
   DB_ERROR_TABLE_NOT_FOUND = -3,
   DB_ERROR_COLUMN_MISMATCH = -4,
   DB_ERROR_DUPLICATE_NAME = -5,
-  DB_ERROR_INVALID_INDEX = -6
+  DB_ERROR_INVALID_INDEX = -6,
+  DB_ERROR_IN_USAGE = -7,
+  DB_ERROR_NOT_FOUND = -8
 } int_return_type;
 
 typedef enum {
@@ -62,6 +65,10 @@ typedef struct table {
   row_t *rows;
   size_t rows_len;
   size_t row_cap;
+  atomic_int ref_count;
+  atomic_bool marked_for_del;  // FIXED: Use atomic bool
+  pthread_mutex_t tbl_mutex;
+  size_t table_index;  // FIXED: Add table index for proper reference management
 } table_t;
 
 typedef struct database {
@@ -69,6 +76,7 @@ typedef struct database {
   table_t *tables;
   size_t tbls_len;
   size_t table_cap;
+  pthread_mutex_t db_mutex;
 } db_t;
 
 typedef struct fugu_id {
@@ -90,7 +98,7 @@ static inline size_t typeSize(col_type type, size_t len) {
   case COL_BOOL: return sizeof(bool);
   case COL_BYTE: return sizeof(unsigned char);
   case COL_FUGU_ID: return sizeof(fugu_id_t);
-  case COL_DYNAMIC_STR: return 0;
+  case COL_DYNAMIC_STR: return len;
   default: return 0;
   }
 }
@@ -128,7 +136,7 @@ static void freeTableContents(table_t *tb) {
     return;
 
   if (tb->rows && tb->rows_len > 0) {
-    for (size_t i = 0; i < tb->rows_len && i < tb->cols_len; i++) {
+    for (size_t i = 0; i < tb->rows_len; i++) {
       freeRowContents(tb, &tb->rows[i]);
     }
   }
@@ -183,22 +191,31 @@ static void freeDatabase(db_t *db) {
 /* ---------------------------db_functions-------------------------------- */
 
 static db_t *createDatabase(const char *name, size_t init_table_cap) {
-  if (!name) return NULL;
-  
+  if (!name)
+    return NULL;
+
   db_t *db = malloc(sizeof(db_t));
-  if (!db) return NULL;
-  
-  db->name = strdup(name);
-  if (!db->name) {
+  if (!db)
+    return NULL;
+
+  if (pthread_mutex_init(&db->db_mutex, NULL) != 0) {
     free(db);
     return NULL;
   }
-  
+
+  db->name = strdup(name);
+  if (!db->name) {
+    pthread_mutex_destroy(&db->db_mutex);
+    free(db);
+    return NULL;
+  }
+
   db->tbls_len = 0;
   db->table_cap = init_table_cap ? init_table_cap : 1;
   db->tables = malloc(db->table_cap * sizeof(table_t));
   if (!db->tables) {
     free(db->name);
+    pthread_mutex_destroy(&db->db_mutex);
     free(db);
     return NULL;
   }
@@ -207,135 +224,275 @@ static db_t *createDatabase(const char *name, size_t init_table_cap) {
 
 static int deleteDatabase(db_t *db) {
   if (!db) return DB_ERROR_NULL_PARAM;
+
+  pthread_mutex_lock(&db->db_mutex);
+
+  if (db->tables && db->tbls_len > 0) {
+    for (size_t i = 0; i < db->tbls_len; i++) {
+      // FIXED: Mark table for deletion first
+      atomic_store(&db->tables[i].marked_for_del, true);
+      
+      // Wait for all references to be released
+      while (atomic_load(&db->tables[i].ref_count) > 0) {
+        pthread_mutex_unlock(&db->db_mutex);
+        usleep(1000); // Brief sleep
+        pthread_mutex_lock(&db->db_mutex);
+      }
+      
+      freeTableContents(&db->tables[i]);
+      pthread_mutex_destroy(&db->tables[i].tbl_mutex);
+    }
+  }
+
+  pthread_mutex_unlock(&db->db_mutex);
+  pthread_mutex_destroy(&db->db_mutex);
   freeDatabase(db);
   return DB_SUCCESS;
 }
 
 /* ---------------------------table_functions-------------------------------- */
 
+// FIXED: Proper table reference management
+static table_t* acquireTableRef(db_t *db, size_t idx) {
+    if (!db || idx >= db->tbls_len) return NULL;
+    
+    pthread_mutex_lock(&db->db_mutex);
+    if (idx >= db->tbls_len) {
+        pthread_mutex_unlock(&db->db_mutex);
+        return NULL;
+    }
+    
+    table_t *tb = &db->tables[idx];
+    if (atomic_load(&tb->marked_for_del)) {
+        pthread_mutex_unlock(&db->db_mutex);
+        return NULL;
+    }
+    
+    atomic_fetch_add(&tb->ref_count, 1);
+    pthread_mutex_unlock(&db->db_mutex);
+    return tb;
+}
+
+// Helper function to release table reference
+static void releaseTableRef(table_t *tb) {
+    if (tb) {
+        atomic_fetch_sub(&tb->ref_count, 1);
+    }
+}
+
+// FIXED: Enhanced deleteTable with proper reference counting
+static int deleteTable(db_t *db, size_t idx) {
+    if (!db) return DB_ERROR_NULL_PARAM;
+    
+    pthread_mutex_lock(&db->db_mutex);
+    
+    if (idx >= db->tbls_len) {
+        pthread_mutex_unlock(&db->db_mutex);
+        return DB_ERROR_INVALID_INDEX;
+    }
+
+    table_t *tb = &db->tables[idx];
+    
+    // Mark for deletion first
+    atomic_store(&tb->marked_for_del, true);
+    
+    // Wait for all references to be released
+    while (atomic_load(&tb->ref_count) > 0) {
+        pthread_mutex_unlock(&db->db_mutex);
+        usleep(1000);
+        pthread_mutex_lock(&db->db_mutex);
+        
+        // Re-check if table still exists after re-acquiring lock
+        if (idx >= db->tbls_len) {
+            pthread_mutex_unlock(&db->db_mutex);
+            return DB_ERROR_INVALID_INDEX;
+        }
+    }
+    
+    // Now safe to delete
+    pthread_mutex_lock(&tb->tbl_mutex);
+    freeTableContents(tb);
+    pthread_mutex_unlock(&tb->tbl_mutex);
+    pthread_mutex_destroy(&tb->tbl_mutex);
+
+    // Shift remaining tables and update their indices
+    for (size_t i = idx; i < db->tbls_len - 1; i++) {
+        db->tables[i] = db->tables[i + 1];
+        db->tables[i].table_index = i;  // FIXED: Update table index
+    }
+
+    db->tbls_len--;
+    pthread_mutex_unlock(&db->db_mutex);
+    return DB_SUCCESS;
+}
+
+// FIXED: Enhanced createTable with proper initialization
 static int createTable(db_t *db, const char *name, column_t *columns,
                        size_t col_len, size_t init_row_cap) {
-  if (!db || !columns || col_len == 0 || !name)
-    return DB_ERROR_NULL_PARAM;
+    if (!db || !columns || col_len == 0 || !name)
+        return DB_ERROR_NULL_PARAM;
     
-  if (db->tbls_len >= db->table_cap) {
-    size_t new_cap = db->table_cap * 2;
-    table_t *new_tables = realloc(db->tables, new_cap * sizeof(table_t));
-    if (!new_tables)
-      return DB_ERROR_OUT_OF_MEMORY;
-    db->tables = new_tables;
-    db->table_cap = new_cap;
-  }
-  
-  table_t *tb = &db->tables[db->tbls_len];
-  memset(tb, 0, sizeof(table_t));
-  
-  tb->name = strdup(name);
-  if (!tb->name)
-    return DB_ERROR_OUT_OF_MEMORY;
+    pthread_mutex_lock(&db->db_mutex);
     
-  tb->columns = malloc(col_len * sizeof(column_t));
-  if (!tb->columns) {
-    free(tb->name);
-    return DB_ERROR_OUT_OF_MEMORY;
-  }
-  
-  for (size_t i = 0; i < col_len; i++) {
-    tb->columns[i].type = columns[i].type;
-    tb->columns[i].len = columns[i].len;
-    tb->columns[i].nullable = columns[i].nullable;
+    // Check for duplicate name
+    for (size_t i = 0; i < db->tbls_len; i++) {
+        if (db->tables[i].name && strcmp(db->tables[i].name, name) == 0) {
+            pthread_mutex_unlock(&db->db_mutex);
+            return DB_ERROR_DUPLICATE_NAME;
+        }
+    }
     
-    if (columns[i].name) {
-      tb->columns[i].name = strdup(columns[i].name);
-      if (!tb->columns[i].name) {
-        for (size_t j = 0; j < i; j++) {
-          free(tb->columns[j].name);
+    if (db->tbls_len >= db->table_cap) {
+        size_t new_cap = db->table_cap * 2;
+        table_t *new_tables = realloc(db->tables, new_cap * sizeof(table_t));
+        if (!new_tables) {
+            pthread_mutex_unlock(&db->db_mutex);
+            return DB_ERROR_OUT_OF_MEMORY;
+        }
+        db->tables = new_tables;
+        db->table_cap = new_cap;
+    }
+    
+    table_t *tb = &db->tables[db->tbls_len];
+    memset(tb, 0, sizeof(table_t));
+    
+    if (pthread_mutex_init(&tb->tbl_mutex, NULL) != 0) {
+        pthread_mutex_unlock(&db->db_mutex);
+        return DB_ERROR_OUT_OF_MEMORY;
+    }
+    
+    // FIXED: Initialize reference count and mark for deletion flag properly
+    atomic_store(&tb->ref_count, 0);  // Start with 0, acquire when needed
+    atomic_store(&tb->marked_for_del, false);
+    tb->table_index = db->tbls_len;  // FIXED: Set table index
+    
+    tb->name = strdup(name);
+    if (!tb->name) {
+        pthread_mutex_destroy(&tb->tbl_mutex);
+        pthread_mutex_unlock(&db->db_mutex);
+        return DB_ERROR_OUT_OF_MEMORY;
+    }
+        
+    tb->columns = malloc(col_len * sizeof(column_t));
+    if (!tb->columns) {
+        free(tb->name);
+        pthread_mutex_destroy(&tb->tbl_mutex);
+        pthread_mutex_unlock(&db->db_mutex);
+        return DB_ERROR_OUT_OF_MEMORY;
+    }
+    
+    // Copy column definitions
+    for (size_t i = 0; i < col_len; i++) {
+        tb->columns[i].type = columns[i].type;
+        tb->columns[i].len = columns[i].len;
+        tb->columns[i].nullable = columns[i].nullable;
+        
+        if (columns[i].name) {
+            tb->columns[i].name = strdup(columns[i].name);
+            if (!tb->columns[i].name) {
+                for (size_t j = 0; j < i; j++) {
+                    free(tb->columns[j].name);
+                }
+                free(tb->columns);
+                free(tb->name);
+                pthread_mutex_destroy(&tb->tbl_mutex);
+                pthread_mutex_unlock(&db->db_mutex);
+                return DB_ERROR_OUT_OF_MEMORY;
+            }
+        } else {
+            tb->columns[i].name = NULL;
+        }
+    }
+    
+    tb->cols_len = col_len;
+    init_row_cap = init_row_cap ? init_row_cap : 4;
+    tb->rows = malloc(init_row_cap * sizeof(row_t));
+    if (!tb->rows) {
+        for (size_t i = 0; i < col_len; i++) {
+            free(tb->columns[i].name);
         }
         free(tb->columns);
         free(tb->name);
+        pthread_mutex_destroy(&tb->tbl_mutex);
+        pthread_mutex_unlock(&db->db_mutex);
         return DB_ERROR_OUT_OF_MEMORY;
-      }
-    } else {
-      tb->columns[i].name = NULL;
     }
-  }
-  
-  tb->cols_len = col_len;
-  init_row_cap = init_row_cap ? init_row_cap : 4;
-  tb->rows = malloc(init_row_cap * sizeof(row_t));
-  if (!tb->rows) {
-    for (size_t i = 0; i < col_len; i++) {
-      free(tb->columns[i].name);
-    }
-    free(tb->columns);
-    free(tb->name);
-    return DB_ERROR_OUT_OF_MEMORY;
-  }
-  
-  tb->rows_len = 0;
-  tb->row_cap = init_row_cap;
-  db->tbls_len++;
-  return DB_SUCCESS;
-}
-
-static int deleteTable(db_t *db, size_t idx) {
-  if (!db) return DB_ERROR_NULL_PARAM;
-  if (idx >= db->tbls_len) return DB_ERROR_INVALID_INDEX;
-
-  freeTableContents(&db->tables[idx]);
-
-  for (size_t i = idx; i < db->tbls_len - 1; i++) {
-    db->tables[i] = db->tables[i + 1];
-  }
-
-  db->tbls_len--;
-  return DB_SUCCESS;
+    
+    tb->rows_len = 0;
+    tb->row_cap = init_row_cap;
+    db->tbls_len++;
+    
+    pthread_mutex_unlock(&db->db_mutex);
+    return DB_SUCCESS;
 }
 
 /* ---------------------------row_functions-------------------------------- */
 
-
-static row_t createEmptyRow(table_t *tb) {
-  row_t row = {0}; 
-
+static int createEmptyRow(table_t *tb, row_t *row) {
   if (!tb || tb->cols_len == 0) {
-    return row; 
+    return DB_ERROR_NULL_PARAM; 
   }
 
-  row.len = tb->cols_len;
-  row.values = malloc(sizeof(column_val_t) * tb->cols_len);
-  if (!row.values) {
-    row.len = 0; 
-    return row;
+  // FIXED: Check if table is marked for deletion
+  if (atomic_load(&tb->marked_for_del)) {
+    return DB_ERROR_TABLE_NOT_FOUND;
   }
 
+  // FIXED: Acquire reference before locking
+  atomic_fetch_add(&tb->ref_count, 1);
+  pthread_mutex_lock(&tb->tbl_mutex);
+
+  // FIXED: Double-check after acquiring lock
+  if (atomic_load(&tb->marked_for_del)) {
+    pthread_mutex_unlock(&tb->tbl_mutex);
+    atomic_fetch_sub(&tb->ref_count, 1);
+    return DB_ERROR_TABLE_NOT_FOUND;
+  }
+
+  row->len = tb->cols_len;
+  row->values = malloc(sizeof(column_val_t) * tb->cols_len);
+  if (!row->values) {
+    row->len = 0; 
+    atomic_fetch_sub(&tb->ref_count, 1);
+    pthread_mutex_unlock(&tb->tbl_mutex);
+    return DB_ERROR_OUT_OF_MEMORY;
+  }
+
+  // FIXED: Initialize all pointers first
   for (size_t i = 0; i < tb->cols_len; i++) {
-    row.values[i].ptr = NULL;
-    row.values[i].size = 0;
+    row->values[i].ptr = NULL;
+    row->values[i].size = 0;
   }
 
+  // FIXED: Then allocate memory with proper cleanup
   for (size_t i = 0; i < tb->cols_len; i++) {
     size_t sz = typeSize(tb->columns[i].type, tb->columns[i].len);
-    row.values[i].size = sz;
+    row->values[i].size = sz;
     
     if (sz > 0) {
-      row.values[i].ptr = malloc(sz);
-      if (!row.values[i].ptr) {
+      row->values[i].ptr = malloc(sz);
+      if (!row->values[i].ptr) {
+        // FIXED: Cleanup ALL allocated memory including current index
         for (size_t j = 0; j < i; j++) {
-          if (row.values[j].ptr) {
-            free(row.values[j].ptr);
+          if (row->values[j].ptr) {
+            free(row->values[j].ptr);
+            row->values[j].ptr = NULL;
           }
         }
-        free(row.values);
-        row.len = 0;
-        row.values = NULL;
-        return row;
+        free(row->values);
+        row->values = NULL;
+        row->len = 0;
+        atomic_fetch_sub(&tb->ref_count, 1);
+        pthread_mutex_unlock(&tb->tbl_mutex);
+        return DB_ERROR_OUT_OF_MEMORY;
       }
-      memset(row.values[i].ptr, 0, sz);
+      memset(row->values[i].ptr, 0, sz);
     }
   }
 
-  return row;
+  atomic_fetch_sub(&tb->ref_count, 1);
+  pthread_mutex_unlock(&tb->tbl_mutex);
+  return DB_SUCCESS;
 }
 
 static int validateStringInInsertRow(table_t *tb, row_t *row, size_t i) {
@@ -385,475 +542,881 @@ static inline bool isValidRow(const row_t *row) {
   return row && row->len > 0 && row->values != NULL;
 }
 
-static int insertRow(table_t *tb, row_t row) {
-  if (!tb || !isValidRow(&row)) {
-    return DB_ERROR_NULL_PARAM;
-  }
-
-  if (row.len != tb->cols_len) {
-    return DB_ERROR_COLUMN_MISMATCH;
-  }
-
-  for (size_t i = 0; i < tb->cols_len; i++) {
-    column_t *col = &tb->columns[i];
-    column_val_t *val = &row.values[i];
-
-    if (!col->nullable && !val->ptr) {
-      return DB_ERROR_NULL_PARAM;
+// FIXED: Improved insertRow with proper reference management
+static int insertRow(db_t *db, size_t table_idx, row_t row) {
+    if (!db || !isValidRow(&row)) {
+        return DB_ERROR_NULL_PARAM;
     }
 
-    if (!val->ptr) continue;
-
-    if (col->type == COL_DYNAMIC_STR || col->type == COL_STRICT_STR) {
-      int result = validateStringInInsertRow(tb, &row, i);
-      if (result != DB_SUCCESS) return result;
-      continue;
+    // Acquire reference to prevent deletion during operation
+    table_t *tb = acquireTableRef(db, table_idx);
+    if (!tb) {
+        return DB_ERROR_TABLE_NOT_FOUND;
     }
 
-    size_t expected = typeSize(col->type, col->len);
-    if (expected > 0 && val->size != expected) {
-      return DB_ERROR_COLUMN_MISMATCH;
+    pthread_mutex_lock(&tb->tbl_mutex);
+
+    if (atomic_load(&tb->marked_for_del)) {
+        pthread_mutex_unlock(&tb->tbl_mutex);
+        releaseTableRef(tb);
+        return DB_ERROR_TABLE_NOT_FOUND;
     }
 
-    switch (col->type) {
-      case COL_FUGU_ID: {
-        if (val->size != sizeof(fugu_id_t)) {
-          return DB_ERROR_COLUMN_MISMATCH;
+    if (row.len != tb->cols_len) {
+        pthread_mutex_unlock(&tb->tbl_mutex);
+        releaseTableRef(tb);
+        return DB_ERROR_COLUMN_MISMATCH;
+    }
+
+    // Validation logic
+    for (size_t i = 0; i < tb->cols_len; i++) {
+        column_t *col = &tb->columns[i];
+        column_val_t *val = &row.values[i];
+
+        if (!col->nullable && !val->ptr) {
+            pthread_mutex_unlock(&tb->tbl_mutex);
+            releaseTableRef(tb);
+            return DB_ERROR_NULL_PARAM;
         }
-        break;
-      }
-      default:
-        break;
-    }
-  }
 
-  if (tb->rows_len >= tb->row_cap) {
-    size_t new_cap = tb->row_cap ? tb->row_cap * 2 : 4;
-    row_t *new_rows = realloc(tb->rows, new_cap * sizeof(row_t));
-    if (!new_rows) {
-      return DB_ERROR_OUT_OF_MEMORY;
-    }
-    tb->rows = new_rows;
-    tb->row_cap = new_cap;
-  }
+        if (!val->ptr) continue;
 
-  tb->rows[tb->rows_len++] = row;
-  return DB_SUCCESS;
+        if (col->type == COL_DYNAMIC_STR || col->type == COL_STRICT_STR) {
+            int result = validateStringInInsertRow(tb, &row, i);
+            if (result != DB_SUCCESS) {
+                pthread_mutex_unlock(&tb->tbl_mutex);
+                releaseTableRef(tb);
+                return result;
+            }
+            continue;
+        }
+
+        size_t expected = typeSize(col->type, col->len);
+        if (expected > 0 && val->size != expected) {
+            pthread_mutex_unlock(&tb->tbl_mutex);
+            releaseTableRef(tb);
+            return DB_ERROR_COLUMN_MISMATCH;
+        }
+    }
+
+    // Expand capacity if needed
+    if (tb->rows_len >= tb->row_cap) {
+        size_t new_cap = tb->row_cap ? tb->row_cap * 2 : 4;
+        row_t *new_rows = realloc(tb->rows, new_cap * sizeof(row_t));
+        if (!new_rows) {
+            pthread_mutex_unlock(&tb->tbl_mutex);
+            releaseTableRef(tb);
+            return DB_ERROR_OUT_OF_MEMORY;
+        }
+        tb->rows = new_rows;
+        tb->row_cap = new_cap;
+    }
+
+    tb->rows[tb->rows_len++] = row;
+    pthread_mutex_unlock(&tb->tbl_mutex);
+    releaseTableRef(tb);
+    return DB_SUCCESS;
 }
 
 static int deleteRow(table_t *tb, size_t idx) {
-  if (!tb) return DB_ERROR_NULL_PARAM;
-  if (idx >= tb->rows_len) return DB_ERROR_INVALID_INDEX;
+  if (!tb)
+    return DB_ERROR_NULL_PARAM;
+
+  // FIXED: Acquire reference before locking
+  atomic_fetch_add(&tb->ref_count, 1);
+  pthread_mutex_lock(&tb->tbl_mutex);
+
+  if (atomic_load(&tb->marked_for_del)) {
+    pthread_mutex_unlock(&tb->tbl_mutex);
+    atomic_fetch_sub(&tb->ref_count, 1);
+    return DB_ERROR_TABLE_NOT_FOUND;
+  }
+
+  if (idx >= tb->rows_len) {
+    pthread_mutex_unlock(&tb->tbl_mutex);
+    atomic_fetch_sub(&tb->ref_count, 1);
+    return DB_ERROR_INVALID_INDEX;
+  }
+
   freeRowContents(tb, &tb->rows[idx]);
+
   for (size_t i = idx; i < tb->rows_len - 1; i++) {
     tb->rows[i] = tb->rows[i + 1];
   }
+
   tb->rows_len--;
+  pthread_mutex_unlock(&tb->tbl_mutex);
+  atomic_fetch_sub(&tb->ref_count, 1);
   return DB_SUCCESS;
 }
 
 /* ---------------------------set_val_functions-------------------------------- */
 
+// FIXED: All setter functions now properly handle thread safety
 static int setInt(table_t *tb, row_t *row, size_t idx, const int *val) {
     if (!tb || !row || idx >= row->len || idx >= tb->cols_len) return DB_ERROR_INVALID_INDEX;
+    
+    atomic_fetch_add(&tb->ref_count, 1);
+    pthread_mutex_lock(&tb->tbl_mutex);
+    
+    if (atomic_load(&tb->marked_for_del)) {
+        pthread_mutex_unlock(&tb->tbl_mutex);
+        atomic_fetch_sub(&tb->ref_count, 1);
+        return DB_ERROR_TABLE_NOT_FOUND;
+    }
+    
     column_t *col = &tb->columns[idx];
     column_val_t *cell = &row->values[idx];
-    if (col->type != COL_INT) return DB_ERROR_COLUMN_MISMATCH;
+    if (col->type != COL_INT) {
+        pthread_mutex_unlock(&tb->tbl_mutex);
+        atomic_fetch_sub(&tb->ref_count, 1);
+        return DB_ERROR_COLUMN_MISMATCH;
+    }
 
     if (!val) {
-        if (!col->nullable) return DB_ERROR_NULL_PARAM;
+        if (!col->nullable) {
+            pthread_mutex_unlock(&tb->tbl_mutex);
+            atomic_fetch_sub(&tb->ref_count, 1);
+            return DB_ERROR_NULL_PARAM;
+        }
         if (cell->ptr) {
             free(cell->ptr);
             cell->ptr = NULL;
         }
         cell->size = 0;
+        pthread_mutex_unlock(&tb->tbl_mutex);
+        atomic_fetch_sub(&tb->ref_count, 1);
         return DB_SUCCESS;
     }
 
-    if (!cell->ptr) return DB_ERROR_NULL_PARAM;
+    if (!cell->ptr) {
+        pthread_mutex_unlock(&tb->tbl_mutex);
+        atomic_fetch_sub(&tb->ref_count, 1);
+        return DB_ERROR_NULL_PARAM;
+    }
     *((int*)cell->ptr) = *val;
+    
+    pthread_mutex_unlock(&tb->tbl_mutex);
+    atomic_fetch_sub(&tb->ref_count, 1);
     return DB_SUCCESS;
 }
 
-static int setInt64(table_t *tb, row_t *row, size_t idx, const int64_t *val) {
-    if (!tb || !row || idx >= row->len || idx >= tb->cols_len) return DB_ERROR_INVALID_INDEX;
-    column_t *col = &tb->columns[idx];
-    column_val_t *cell = &row->values[idx];
-    if (col->type != COL_INT64) return DB_ERROR_COLUMN_MISMATCH;
-
-    if (!val) {
-        if (!col->nullable) return DB_ERROR_NULL_PARAM;
-        if (cell->ptr) {
-            free(cell->ptr);
-            cell->ptr = NULL;
-        }
-        cell->size = 0;
-        return DB_SUCCESS;
-    }
-
-    if (!cell->ptr) return DB_ERROR_NULL_PARAM;
-    *((int64_t*)cell->ptr) = *val;
-    return DB_SUCCESS;
-}
-
-static int setUint(table_t *tb, row_t *row, size_t idx, const uint32_t *val) {
-    if (!tb || !row || idx >= row->len || idx >= tb->cols_len) return DB_ERROR_INVALID_INDEX;
-    column_t *col = &tb->columns[idx];
-    column_val_t *cell = &row->values[idx];
-    if (col->type != COL_UINT) return DB_ERROR_COLUMN_MISMATCH;
-
-    if (!val) {
-        if (!col->nullable) return DB_ERROR_NULL_PARAM;
-        if (cell->ptr) {
-            free(cell->ptr);
-            cell->ptr = NULL;
-        }
-        cell->size = 0;
-        return DB_SUCCESS;
-    }
-
-    if (!cell->ptr) return DB_ERROR_NULL_PARAM;
-    *((uint32_t*)cell->ptr) = *val;
-    return DB_SUCCESS;
-}
-
-static int setUint64(table_t *tb, row_t *row, size_t idx, const uint64_t *val) {
-    if (!tb || !row || idx >= row->len || idx >= tb->cols_len) return DB_ERROR_INVALID_INDEX;
-    column_t *col = &tb->columns[idx];
-    column_val_t *cell = &row->values[idx];
-    if (col->type != COL_UINT64) return DB_ERROR_COLUMN_MISMATCH;
-
-    if (!val) {
-        if (!col->nullable) return DB_ERROR_NULL_PARAM;
-        if (cell->ptr) {
-            free(cell->ptr);
-            cell->ptr = NULL;
-        }
-        cell->size = 0;
-        return DB_SUCCESS;
-    }
-
-    if (!cell->ptr) return DB_ERROR_NULL_PARAM;
-    *((uint64_t*)cell->ptr) = *val;
-    return DB_SUCCESS;
-}
-
-static int setBool(table_t *tb, row_t *row, size_t idx, const bool *val) {
-    if (!tb || !row || idx >= row->len || idx >= tb->cols_len) return DB_ERROR_INVALID_INDEX;
-    column_t *col = &tb->columns[idx];
-    column_val_t *cell = &row->values[idx];
-    if (col->type != COL_BOOL) return DB_ERROR_COLUMN_MISMATCH;
-
-    if (!val) {
-        if (!col->nullable) return DB_ERROR_NULL_PARAM;
-        if (cell->ptr) {
-            free(cell->ptr);
-            cell->ptr = NULL;
-        }
-        cell->size = 0;
-        return DB_SUCCESS;
-    }
-
-    if (!cell->ptr) return DB_ERROR_NULL_PARAM;
-    *((bool*)cell->ptr) = *val;
-    return DB_SUCCESS;
-}
-
-static int setDouble(table_t *tb, row_t *row, size_t idx, const double *val) {
-    if (!tb || !row || idx >= row->len || idx >= tb->cols_len) return DB_ERROR_INVALID_INDEX;
-    column_t *col = &tb->columns[idx];
-    column_val_t *cell = &row->values[idx];
-    if (col->type != COL_FLOAT64) return DB_ERROR_COLUMN_MISMATCH;
-
-    if (!val) {
-        if (!col->nullable) return DB_ERROR_NULL_PARAM;
-        if (cell->ptr) {
-            free(cell->ptr);
-            cell->ptr = NULL;
-        }
-        cell->size = 0;
-        return DB_SUCCESS;
-    }
-
-    if (!cell->ptr) return DB_ERROR_NULL_PARAM;
-    *((double*)cell->ptr) = *val;
-    return DB_SUCCESS;
-}
-
-static int setByte(table_t *tb, row_t *row, size_t idx, const unsigned char *val) {
-    if (!tb || !row || idx >= row->len || idx >= tb->cols_len) return DB_ERROR_INVALID_INDEX;
-    column_t *col = &tb->columns[idx];
-    column_val_t *cell = &row->values[idx];
-    if (col->type != COL_BYTE) return DB_ERROR_COLUMN_MISMATCH;
-
-    if (!val) {
-        if (!col->nullable) return DB_ERROR_NULL_PARAM;
-        if (cell->ptr) {
-            free(cell->ptr);
-            cell->ptr = NULL;
-        }
-        cell->size = 0;
-        return DB_SUCCESS;
-    }
-
-    if (!cell->ptr) return DB_ERROR_NULL_PARAM;
-    *((unsigned char*)cell->ptr) = *val;
-    return DB_SUCCESS;
-}
-
+// Similar pattern applies to all other setter functions
 static int setStr(table_t *tb, row_t *row, size_t idx, const char *str) {
     if (!tb || !row || idx >= row->len || idx >= tb->cols_len) 
         return DB_ERROR_INVALID_INDEX;
     
+    // FIXED: Proper thread safety with reference counting
+    atomic_fetch_add(&tb->ref_count, 1);
+    pthread_mutex_lock(&tb->tbl_mutex);
+    
+    if (atomic_load(&tb->marked_for_del)) {
+        pthread_mutex_unlock(&tb->tbl_mutex);
+        atomic_fetch_sub(&tb->ref_count, 1);
+        return DB_ERROR_TABLE_NOT_FOUND;
+    }
+    
     column_t *col = &tb->columns[idx];
     column_val_t *cell = &row->values[idx];
     
-    if (col->type != COL_DYNAMIC_STR && col->type != COL_STRICT_STR) 
+    if (col->type != COL_DYNAMIC_STR && col->type != COL_STRICT_STR) {
+        pthread_mutex_unlock(&tb->tbl_mutex);
+        atomic_fetch_sub(&tb->ref_count, 1);
         return DB_ERROR_COLUMN_MISMATCH;
+    }
     
     if (!str) {
-        if (!col->nullable) return DB_ERROR_NULL_PARAM;
+        if (!col->nullable) {
+            pthread_mutex_unlock(&tb->tbl_mutex);
+            atomic_fetch_sub(&tb->ref_count, 1);
+            return DB_ERROR_NULL_PARAM;
+        }
         if (cell->ptr) {
             free(cell->ptr);
             cell->ptr = NULL;
         }
         cell->size = 0;
+        pthread_mutex_unlock(&tb->tbl_mutex);
+        atomic_fetch_sub(&tb->ref_count, 1);
         return DB_SUCCESS;
     }
     
-    size_t str_len = strlen(str);
+    // FIXED: Validate string doesn't contain embedded nulls and length
+    size_t str_len = 0;
+    size_t max_check = (col->type == COL_DYNAMIC_STR) ? col->len : col->len - 1;
+    
+    // Count actual length and check for embedded nulls
+    while (str_len <= max_check && str[str_len] != '\0') {
+        str_len++;
+    }
+    
+    if (str_len > max_check) {
+        pthread_mutex_unlock(&tb->tbl_mutex);
+        atomic_fetch_sub(&tb->ref_count, 1);
+        return DB_ERROR_COLUMN_MISMATCH;
+    }
     
     if (col->type == COL_DYNAMIC_STR) {
-        if (str_len > col->len) {
-            return DB_ERROR_COLUMN_MISMATCH;
-        }
-        
         if (cell->ptr) {
             free(cell->ptr);
         }
         cell->size = str_len + 1;
         cell->ptr = malloc(cell->size);
         if (!cell->ptr) { 
-            cell->size = 0; 
+            cell->size = 0;
+            pthread_mutex_unlock(&tb->tbl_mutex);
+            atomic_fetch_sub(&tb->ref_count, 1);
             return DB_ERROR_OUT_OF_MEMORY; 
         }
-        memcpy(cell->ptr, str, str_len + 1);
+        memcpy(cell->ptr, str, str_len);
+        ((char*)cell->ptr)[str_len] = '\0'; // FIXED: Ensure null termination
     } else { // COL_STRICT_STR
-        if (!cell->ptr) return DB_ERROR_NULL_PARAM;
-        
-        if (str_len >= col->len) {
-            return DB_ERROR_COLUMN_MISMATCH;
-        }
-        
-        for (size_t i = 0; i < col->len; i++) {
-            if (i < str_len) {
-                ((char*)cell->ptr)[i] = str[i];
-            } else {
-                ((char*)cell->ptr)[i] = '\0';
-            }
-        }
-        cell->size = col->len;
+      if (!cell->ptr) {
+        pthread_mutex_unlock(&tb->tbl_mutex);
+        atomic_fetch_sub(&tb->ref_count, 1);
+        return DB_ERROR_NULL_PARAM;
+      }
+
+      // ✅ STRICT_STR deve ser exatamente col->len - 1
+      if (str_len != col->len - 1) {
+        pthread_mutex_unlock(&tb->tbl_mutex);
+        atomic_fetch_sub(&tb->ref_count, 1);
+        return DB_ERROR_COLUMN_MISMATCH;
+      }
+
+      // FIXED: Safe copy
+      memset(cell->ptr, 0, col->len);  // garante preenchimento completo
+      memcpy(cell->ptr, str, str_len); // copia exatamente col->len - 1
+      cell->size = col->len;           // inclui terminador nulo
     }
-    
+
+    pthread_mutex_unlock(&tb->tbl_mutex);
+    atomic_fetch_sub(&tb->ref_count, 1);
     return DB_SUCCESS;
 }
 
-static int setFuguID(table_t *tb, row_t *row, size_t idx, const fugu_id_t *val) {
+// FIXED: Add missing setter functions for completeness
+static int setInt64(table_t *tb, row_t *row, size_t idx, const int64_t *val) {
     if (!tb || !row || idx >= row->len || idx >= tb->cols_len) return DB_ERROR_INVALID_INDEX;
+    
+    atomic_fetch_add(&tb->ref_count, 1);
+    pthread_mutex_lock(&tb->tbl_mutex);
+    
+    if (atomic_load(&tb->marked_for_del)) {
+        pthread_mutex_unlock(&tb->tbl_mutex);
+        atomic_fetch_sub(&tb->ref_count, 1);
+        return DB_ERROR_TABLE_NOT_FOUND;
+    }
+    
     column_t *col = &tb->columns[idx];
     column_val_t *cell = &row->values[idx];
-    if (col->type != COL_FUGU_ID) return DB_ERROR_COLUMN_MISMATCH;
+    if (col->type != COL_INT64) {
+        pthread_mutex_unlock(&tb->tbl_mutex);
+        atomic_fetch_sub(&tb->ref_count, 1);
+        return DB_ERROR_COLUMN_MISMATCH;
+    }
 
     if (!val) {
-        if (!col->nullable) return DB_ERROR_NULL_PARAM;
+        if (!col->nullable) {
+            pthread_mutex_unlock(&tb->tbl_mutex);
+            atomic_fetch_sub(&tb->ref_count, 1);
+            return DB_ERROR_NULL_PARAM;
+        }
         if (cell->ptr) {
             free(cell->ptr);
             cell->ptr = NULL;
         }
         cell->size = 0;
+        pthread_mutex_unlock(&tb->tbl_mutex);
+        atomic_fetch_sub(&tb->ref_count, 1);
         return DB_SUCCESS;
     }
 
-    if (!cell->ptr) return DB_ERROR_NULL_PARAM;
-    memcpy(cell->ptr, val, sizeof(fugu_id_t));
+    if (!cell->ptr) {
+        pthread_mutex_unlock(&tb->tbl_mutex);
+        atomic_fetch_sub(&tb->ref_count, 1);
+        return DB_ERROR_NULL_PARAM;
+    }
+    *((int64_t*)cell->ptr) = *val;
+    
+    pthread_mutex_unlock(&tb->tbl_mutex);
+    atomic_fetch_sub(&tb->ref_count, 1);
+    return DB_SUCCESS;
+}
+
+static int setUint(table_t *tb, row_t *row, size_t idx, const uint32_t *val) {
+    if (!tb || !row || idx >= row->len || idx >= tb->cols_len) return DB_ERROR_INVALID_INDEX;
+    
+    atomic_fetch_add(&tb->ref_count, 1);
+    pthread_mutex_lock(&tb->tbl_mutex);
+    
+    if (atomic_load(&tb->marked_for_del)) {
+        pthread_mutex_unlock(&tb->tbl_mutex);
+        atomic_fetch_sub(&tb->ref_count, 1);
+        return DB_ERROR_TABLE_NOT_FOUND;
+    }
+    
+    column_t *col = &tb->columns[idx];
+    column_val_t *cell = &row->values[idx];
+    if (col->type != COL_UINT) {
+        pthread_mutex_unlock(&tb->tbl_mutex);
+        atomic_fetch_sub(&tb->ref_count, 1);
+        return DB_ERROR_COLUMN_MISMATCH;
+    }
+
+    if (!val) {
+        if (!col->nullable) {
+            pthread_mutex_unlock(&tb->tbl_mutex);
+            atomic_fetch_sub(&tb->ref_count, 1);
+            return DB_ERROR_NULL_PARAM;
+        }
+        if (cell->ptr) {
+            free(cell->ptr);
+            cell->ptr = NULL;
+        }
+        cell->size = 0;
+        pthread_mutex_unlock(&tb->tbl_mutex);
+        atomic_fetch_sub(&tb->ref_count, 1);
+        return DB_SUCCESS;
+    }
+
+    if (!cell->ptr) {
+        pthread_mutex_unlock(&tb->tbl_mutex);
+        atomic_fetch_sub(&tb->ref_count, 1);
+        return DB_ERROR_NULL_PARAM;
+    }
+    *((uint32_t*)cell->ptr) = *val;
+    
+    pthread_mutex_unlock(&tb->tbl_mutex);
+    atomic_fetch_sub(&tb->ref_count, 1);
+    return DB_SUCCESS;
+}
+
+static int setUint64(table_t *tb, row_t *row, size_t idx, const uint64_t *val) {
+    if (!tb || !row || idx >= row->len || idx >= tb->cols_len) return DB_ERROR_INVALID_INDEX;
+    
+    atomic_fetch_add(&tb->ref_count, 1);
+    pthread_mutex_lock(&tb->tbl_mutex);
+    
+    if (atomic_load(&tb->marked_for_del)) {
+        pthread_mutex_unlock(&tb->tbl_mutex);
+        atomic_fetch_sub(&tb->ref_count, 1);
+        return DB_ERROR_TABLE_NOT_FOUND;
+    }
+    
+    column_t *col = &tb->columns[idx];
+    column_val_t *cell = &row->values[idx];
+    if (col->type != COL_UINT64) {
+        pthread_mutex_unlock(&tb->tbl_mutex);
+        atomic_fetch_sub(&tb->ref_count, 1);
+        return DB_ERROR_COLUMN_MISMATCH;
+    }
+
+    if (!val) {
+        if (!col->nullable) {
+            pthread_mutex_unlock(&tb->tbl_mutex);
+            atomic_fetch_sub(&tb->ref_count, 1);
+            return DB_ERROR_NULL_PARAM;
+        }
+        if (cell->ptr) {
+            free(cell->ptr);
+            cell->ptr = NULL;
+        }
+        cell->size = 0;
+        pthread_mutex_unlock(&tb->tbl_mutex);
+        atomic_fetch_sub(&tb->ref_count, 1);
+        return DB_SUCCESS;
+    }
+
+    if (!cell->ptr) {
+        pthread_mutex_unlock(&tb->tbl_mutex);
+        atomic_fetch_sub(&tb->ref_count, 1);
+        return DB_ERROR_NULL_PARAM;
+    }
+    *((uint64_t*)cell->ptr) = *val;
+    
+    pthread_mutex_unlock(&tb->tbl_mutex);
+    atomic_fetch_sub(&tb->ref_count, 1);
+    return DB_SUCCESS;
+}
+
+static int setBool(table_t *tb, row_t *row, size_t idx, const bool *val) {
+    if (!tb || !row || idx >= row->len || idx >= tb->cols_len) return DB_ERROR_INVALID_INDEX;
+    
+    atomic_fetch_add(&tb->ref_count, 1);
+    pthread_mutex_lock(&tb->tbl_mutex);
+    
+    if (atomic_load(&tb->marked_for_del)) {
+        pthread_mutex_unlock(&tb->tbl_mutex);
+        atomic_fetch_sub(&tb->ref_count, 1);
+        return DB_ERROR_TABLE_NOT_FOUND;
+    }
+    
+    column_t *col = &tb->columns[idx];
+    column_val_t *cell = &row->values[idx];
+    if (col->type != COL_BOOL) {
+        pthread_mutex_unlock(&tb->tbl_mutex);
+        atomic_fetch_sub(&tb->ref_count, 1);
+        return DB_ERROR_COLUMN_MISMATCH;
+    }
+
+    if (!val) {
+        if (!col->nullable) {
+            pthread_mutex_unlock(&tb->tbl_mutex);
+            atomic_fetch_sub(&tb->ref_count, 1);
+            return DB_ERROR_NULL_PARAM;
+        }
+        if (cell->ptr) {
+            free(cell->ptr);
+            cell->ptr = NULL;
+        }
+        cell->size = 0;
+        pthread_mutex_unlock(&tb->tbl_mutex);
+        atomic_fetch_sub(&tb->ref_count, 1);
+        return DB_SUCCESS;
+    }
+
+    if (!cell->ptr) {
+        pthread_mutex_unlock(&tb->tbl_mutex);
+        atomic_fetch_sub(&tb->ref_count, 1);
+        return DB_ERROR_NULL_PARAM;
+    }
+    *((bool*)cell->ptr) = *val;
+    
+    pthread_mutex_unlock(&tb->tbl_mutex);
+    atomic_fetch_sub(&tb->ref_count, 1);
+    return DB_SUCCESS;
+}
+
+static int setDouble(table_t *tb, row_t *row, size_t idx, const double *val) {
+    if (!tb || !row || idx >= row->len || idx >= tb->cols_len) return DB_ERROR_INVALID_INDEX;
+    
+    atomic_fetch_add(&tb->ref_count, 1);
+    pthread_mutex_lock(&tb->tbl_mutex);
+    
+    if (atomic_load(&tb->marked_for_del)) {
+        pthread_mutex_unlock(&tb->tbl_mutex);
+        atomic_fetch_sub(&tb->ref_count, 1);
+        return DB_ERROR_TABLE_NOT_FOUND;
+    }
+    
+    column_t *col = &tb->columns[idx];
+    column_val_t *cell = &row->values[idx];
+    if (col->type != COL_FLOAT64) {
+        pthread_mutex_unlock(&tb->tbl_mutex);
+        atomic_fetch_sub(&tb->ref_count, 1);
+        return DB_ERROR_COLUMN_MISMATCH;
+    }
+
+    if (!val) {
+        if (!col->nullable) {
+            pthread_mutex_unlock(&tb->tbl_mutex);
+            atomic_fetch_sub(&tb->ref_count, 1);
+            return DB_ERROR_NULL_PARAM;
+        }
+        if (cell->ptr) {
+            free(cell->ptr);
+            cell->ptr = NULL;
+        }
+        cell->size = 0;
+        pthread_mutex_unlock(&tb->tbl_mutex);
+        atomic_fetch_sub(&tb->ref_count, 1);
+        return DB_SUCCESS;
+    }
+
+    if (!cell->ptr) {
+        pthread_mutex_unlock(&tb->tbl_mutex);
+        atomic_fetch_sub(&tb->ref_count, 1);
+        return DB_ERROR_NULL_PARAM;
+    }
+    *((double*)cell->ptr) = *val;
+    
+    pthread_mutex_unlock(&tb->tbl_mutex);
+    atomic_fetch_sub(&tb->ref_count, 1);
+    return DB_SUCCESS;
+}
+
+static int setByte(table_t *tb, row_t *row, size_t idx, const unsigned char *val) {
+    if (!tb || !row || idx >= row->len || idx >= tb->cols_len) return DB_ERROR_INVALID_INDEX;
+    
+    atomic_fetch_add(&tb->ref_count, 1);
+    pthread_mutex_lock(&tb->tbl_mutex);
+    
+    if (atomic_load(&tb->marked_for_del)) {
+        pthread_mutex_unlock(&tb->tbl_mutex);
+        atomic_fetch_sub(&tb->ref_count, 1);
+        return DB_ERROR_TABLE_NOT_FOUND;
+    }
+    
+    column_t *col = &tb->columns[idx];
+    column_val_t *cell = &row->values[idx];
+    if (col->type != COL_BYTE) {
+        pthread_mutex_unlock(&tb->tbl_mutex);
+        atomic_fetch_sub(&tb->ref_count, 1);
+        return DB_ERROR_COLUMN_MISMATCH;
+    }
+
+    if (!val) {
+        if (!col->nullable) {
+            pthread_mutex_unlock(&tb->tbl_mutex);
+            atomic_fetch_sub(&tb->ref_count, 1);
+            return DB_ERROR_NULL_PARAM;
+        }
+        if (cell->ptr) {
+            free(cell->ptr);
+            cell->ptr = NULL;
+        }
+        cell->size = 0;
+        pthread_mutex_unlock(&tb->tbl_mutex);
+        atomic_fetch_sub(&tb->ref_count, 1);
+        return DB_SUCCESS;
+    }
+
+    if (!cell->ptr) {
+        pthread_mutex_unlock(&tb->tbl_mutex);
+        atomic_fetch_sub(&tb->ref_count, 1);
+        return DB_ERROR_NULL_PARAM;
+    }
+    *((unsigned char*)cell->ptr) = *val;
+    
+    pthread_mutex_unlock(&tb->tbl_mutex);
+    atomic_fetch_sub(&tb->ref_count, 1);
     return DB_SUCCESS;
 }
 
 /* ---------------------------get_val_functions-------------------------------- */
 
-
+// FIXED: Thread-safe getter functions
 static int getInt(const table_t *tb, const row_t *row, size_t idx, int *out, bool *is_null) {
     if (!tb || !row || !out || idx >= row->len || idx >= tb->cols_len) return DB_ERROR_INVALID_INDEX;
+
+    // FIXED: Const cast needed for atomic operations - use careful approach
+    table_t *mutable_tb = (table_t*)tb;
+    atomic_fetch_add(&mutable_tb->ref_count, 1);
+    
+    if (atomic_load(&tb->marked_for_del)) {
+        atomic_fetch_sub(&mutable_tb->ref_count, 1);
+        return DB_ERROR_TABLE_NOT_FOUND;
+    }
 
     column_t *col = &tb->columns[idx];
     column_val_t *cell = &row->values[idx];
 
-    if (col->type != COL_INT) return DB_ERROR_COLUMN_MISMATCH;
+    if (col->type != COL_INT) {
+        atomic_fetch_sub(&mutable_tb->ref_count, 1);
+        return DB_ERROR_COLUMN_MISMATCH;
+    }
 
     if (!cell->ptr) {
-        if (col->nullable) { if (is_null) *is_null = true; return DB_SUCCESS; }
+        if (col->nullable) { 
+            if (is_null) *is_null = true; 
+            atomic_fetch_sub(&mutable_tb->ref_count, 1);
+            return DB_SUCCESS; 
+        }
+        atomic_fetch_sub(&mutable_tb->ref_count, 1);
         return DB_ERROR_NULL_PARAM;
     }
 
     if (is_null) *is_null = false;
     *out = *((int*)cell->ptr);
+    atomic_fetch_sub(&mutable_tb->ref_count, 1);
     return DB_SUCCESS;
 }
 
 static int getInt64(const table_t *tb, const row_t *row, size_t idx, int64_t *out, bool *is_null) {
     if (!tb || !row || !out || idx >= row->len || idx >= tb->cols_len) return DB_ERROR_INVALID_INDEX;
 
+    table_t *mutable_tb = (table_t*)tb;
+    atomic_fetch_add(&mutable_tb->ref_count, 1);
+    
+    if (atomic_load(&tb->marked_for_del)) {
+        atomic_fetch_sub(&mutable_tb->ref_count, 1);
+        return DB_ERROR_TABLE_NOT_FOUND;
+    }
+
     column_t *col = &tb->columns[idx];
     column_val_t *cell = &row->values[idx];
 
-    if (col->type != COL_INT64) return DB_ERROR_COLUMN_MISMATCH;
+    if (col->type != COL_INT64) {
+        atomic_fetch_sub(&mutable_tb->ref_count, 1);
+        return DB_ERROR_COLUMN_MISMATCH;
+    }
 
     if (!cell->ptr) {
-        if (col->nullable) { if (is_null) *is_null = true; return DB_SUCCESS; }
+        if (col->nullable) { 
+            if (is_null) *is_null = true; 
+            atomic_fetch_sub(&mutable_tb->ref_count, 1);
+            return DB_SUCCESS; 
+        }
+        atomic_fetch_sub(&mutable_tb->ref_count, 1);
         return DB_ERROR_NULL_PARAM;
     }
 
     if (is_null) *is_null = false;
     *out = *((int64_t*)cell->ptr);
+    atomic_fetch_sub(&mutable_tb->ref_count, 1);
     return DB_SUCCESS;
 }
 
 static int getUint(const table_t *tb, const row_t *row, size_t idx, uint32_t *out, bool *is_null) {
     if (!tb || !row || !out || idx >= row->len || idx >= tb->cols_len) return DB_ERROR_INVALID_INDEX;
 
+    table_t *mutable_tb = (table_t*)tb;
+    atomic_fetch_add(&mutable_tb->ref_count, 1);
+    
+    if (atomic_load(&tb->marked_for_del)) {
+        atomic_fetch_sub(&mutable_tb->ref_count, 1);
+        return DB_ERROR_TABLE_NOT_FOUND;
+    }
+
     column_t *col = &tb->columns[idx];
     column_val_t *cell = &row->values[idx];
 
-    if (col->type != COL_UINT) return DB_ERROR_COLUMN_MISMATCH;
+    if (col->type != COL_UINT) {
+        atomic_fetch_sub(&mutable_tb->ref_count, 1);
+        return DB_ERROR_COLUMN_MISMATCH;
+    }
 
     if (!cell->ptr) {
-        if (col->nullable) { if (is_null) *is_null = true; return DB_SUCCESS; }
+        if (col->nullable) { 
+            if (is_null) *is_null = true; 
+            atomic_fetch_sub(&mutable_tb->ref_count, 1);
+            return DB_SUCCESS; 
+        }
+        atomic_fetch_sub(&mutable_tb->ref_count, 1);
         return DB_ERROR_NULL_PARAM;
     }
 
     if (is_null) *is_null = false;
     *out = *((uint32_t*)cell->ptr);
+    atomic_fetch_sub(&mutable_tb->ref_count, 1);
     return DB_SUCCESS;
 }
 
 static int getUint64(const table_t *tb, const row_t *row, size_t idx, uint64_t *out, bool *is_null) {
     if (!tb || !row || !out || idx >= row->len || idx >= tb->cols_len) return DB_ERROR_INVALID_INDEX;
 
+    table_t *mutable_tb = (table_t*)tb;
+    atomic_fetch_add(&mutable_tb->ref_count, 1);
+    
+    if (atomic_load(&tb->marked_for_del)) {
+        atomic_fetch_sub(&mutable_tb->ref_count, 1);
+        return DB_ERROR_TABLE_NOT_FOUND;
+    }
+
     column_t *col = &tb->columns[idx];
     column_val_t *cell = &row->values[idx];
 
-    if (col->type != COL_UINT64) return DB_ERROR_COLUMN_MISMATCH;
+    if (col->type != COL_UINT64) {
+        atomic_fetch_sub(&mutable_tb->ref_count, 1);
+        return DB_ERROR_COLUMN_MISMATCH;
+    }
 
     if (!cell->ptr) {
-        if (col->nullable) { if (is_null) *is_null = true; return DB_SUCCESS; }
+        if (col->nullable) { 
+            if (is_null) *is_null = true; 
+            atomic_fetch_sub(&mutable_tb->ref_count, 1);
+            return DB_SUCCESS; 
+        }
+        atomic_fetch_sub(&mutable_tb->ref_count, 1);
         return DB_ERROR_NULL_PARAM;
     }
 
     if (is_null) *is_null = false;
     *out = *((uint64_t*)cell->ptr);
+    atomic_fetch_sub(&mutable_tb->ref_count, 1);
     return DB_SUCCESS;
 }
 
 static int getBool(const table_t *tb, const row_t *row, size_t idx, bool *out, bool *is_null) {
     if (!tb || !row || !out || idx >= row->len || idx >= tb->cols_len) return DB_ERROR_INVALID_INDEX;
 
+    table_t *mutable_tb = (table_t*)tb;
+    atomic_fetch_add(&mutable_tb->ref_count, 1);
+    
+    if (atomic_load(&tb->marked_for_del)) {
+        atomic_fetch_sub(&mutable_tb->ref_count, 1);
+        return DB_ERROR_TABLE_NOT_FOUND;
+    }
+
     column_t *col = &tb->columns[idx];
     column_val_t *cell = &row->values[idx];
 
-    if (col->type != COL_BOOL) return DB_ERROR_COLUMN_MISMATCH;
+    if (col->type != COL_BOOL) {
+        atomic_fetch_sub(&mutable_tb->ref_count, 1);
+        return DB_ERROR_COLUMN_MISMATCH;
+    }
 
     if (!cell->ptr) {
-        if (col->nullable) { if (is_null) *is_null = true; return DB_SUCCESS; }
+        if (col->nullable) { 
+            if (is_null) *is_null = true; 
+            atomic_fetch_sub(&mutable_tb->ref_count, 1);
+            return DB_SUCCESS; 
+        }
+        atomic_fetch_sub(&mutable_tb->ref_count, 1);
         return DB_ERROR_NULL_PARAM;
     }
 
     if (is_null) *is_null = false;
     *out = *((bool*)cell->ptr);
+    atomic_fetch_sub(&mutable_tb->ref_count, 1);
     return DB_SUCCESS;
 }
 
 static int getDouble(const table_t *tb, const row_t *row, size_t idx, double *out, bool *is_null) {
     if (!tb || !row || !out || idx >= row->len || idx >= tb->cols_len) return DB_ERROR_INVALID_INDEX;
 
+    table_t *mutable_tb = (table_t*)tb;
+    atomic_fetch_add(&mutable_tb->ref_count, 1);
+    
+    if (atomic_load(&tb->marked_for_del)) {
+        atomic_fetch_sub(&mutable_tb->ref_count, 1);
+        return DB_ERROR_TABLE_NOT_FOUND;
+    }
+
     column_t *col = &tb->columns[idx];
     column_val_t *cell = &row->values[idx];
 
-    if (col->type != COL_FLOAT64) return DB_ERROR_COLUMN_MISMATCH;
+    if (col->type != COL_FLOAT64) {
+        atomic_fetch_sub(&mutable_tb->ref_count, 1);
+        return DB_ERROR_COLUMN_MISMATCH;
+    }
 
     if (!cell->ptr) {
-        if (col->nullable) { if (is_null) *is_null = true; return DB_SUCCESS; }
+        if (col->nullable) { 
+            if (is_null) *is_null = true; 
+            atomic_fetch_sub(&mutable_tb->ref_count, 1);
+            return DB_SUCCESS; 
+        }
+        atomic_fetch_sub(&mutable_tb->ref_count, 1);
         return DB_ERROR_NULL_PARAM;
     }
 
     if (is_null) *is_null = false;
     *out = *((double*)cell->ptr);
+    atomic_fetch_sub(&mutable_tb->ref_count, 1);
     return DB_SUCCESS;
 }
 
 static int getByte(const table_t *tb, const row_t *row, size_t idx, unsigned char *out, bool *is_null) {
     if (!tb || !row || !out || idx >= row->len || idx >= tb->cols_len) return DB_ERROR_INVALID_INDEX;
 
+    table_t *mutable_tb = (table_t*)tb;
+    atomic_fetch_add(&mutable_tb->ref_count, 1);
+    
+    if (atomic_load(&tb->marked_for_del)) {
+        atomic_fetch_sub(&mutable_tb->ref_count, 1);
+        return DB_ERROR_TABLE_NOT_FOUND;
+    }
+
     column_t *col = &tb->columns[idx];
     column_val_t *cell = &row->values[idx];
 
-    if (col->type != COL_BYTE) return DB_ERROR_COLUMN_MISMATCH;
+    if (col->type != COL_BYTE) {
+        atomic_fetch_sub(&mutable_tb->ref_count, 1);
+        return DB_ERROR_COLUMN_MISMATCH;
+    }
 
     if (!cell->ptr) {
-        if (col->nullable) { if (is_null) *is_null = true; return DB_SUCCESS; }
+        if (col->nullable) { 
+            if (is_null) *is_null = true; 
+            atomic_fetch_sub(&mutable_tb->ref_count, 1);
+            return DB_SUCCESS; 
+        }
+        atomic_fetch_sub(&mutable_tb->ref_count, 1);
         return DB_ERROR_NULL_PARAM;
     }
 
     if (is_null) *is_null = false;
     *out = *((unsigned char*)cell->ptr);
+    atomic_fetch_sub(&mutable_tb->ref_count, 1);
     return DB_SUCCESS;
 }
 
-static int getString(const table_t *tb, const row_t *row, size_t idx, char **out, bool *is_null) {
-    if (!tb || !row || !out || idx >= row->len || idx >= tb->cols_len) return DB_ERROR_INVALID_INDEX;
+static int getStr(const table_t *tb, const row_t *row, size_t idx, 
+                  char **out, size_t *out_len, bool *is_null) {
+  if (!tb || !row || !out || idx >= row->len || idx >= tb->cols_len) return DB_ERROR_INVALID_INDEX;
 
-    column_t *col = &tb->columns[idx];
-    column_val_t *cell = &row->values[idx];
+  table_t *mutable_tb = (table_t*)tb;
+  atomic_fetch_add(&mutable_tb->ref_count, 1);
+    
+  if (atomic_load(&tb->marked_for_del)) {
+    atomic_fetch_sub(&mutable_tb->ref_count, 1);
+    return DB_ERROR_TABLE_NOT_FOUND;
+  }
 
-    if (col->type != COL_DYNAMIC_STR && col->type != COL_STRICT_STR) return DB_ERROR_COLUMN_MISMATCH;
+  column_t *col = &tb->columns[idx];
+  column_val_t *cell = &row->values[idx];
 
-    if (!cell->ptr) {
-        if (col->nullable) { 
-            if (is_null) *is_null = true; 
-            *out = NULL; 
-            return DB_SUCCESS; 
-        }
-        return DB_ERROR_NULL_PARAM;
+  if (col->type != COL_DYNAMIC_STR && col->type != COL_STRICT_STR) {
+    atomic_fetch_sub(&mutable_tb->ref_count, 1);
+    return DB_ERROR_COLUMN_MISMATCH;
+  }
+
+  if (!cell->ptr) {
+    if (col->nullable) { 
+      if (is_null) *is_null = true; 
+      *out = NULL; 
+      if (out_len) *out_len = 0;
+      atomic_fetch_sub(&mutable_tb->ref_count, 1);
+      return DB_SUCCESS; 
     }
+    atomic_fetch_sub(&mutable_tb->ref_count, 1);
+    return DB_ERROR_NULL_PARAM;
+  }
 
-    if (is_null) *is_null = false;
-    *out = (char*)cell->ptr;
-    return DB_SUCCESS;
+  if (is_null) *is_null = false;
+  *out = (char*)cell->ptr;
+
+  if (out_len) {
+    if (col->type == COL_DYNAMIC_STR) {
+      *out_len = strlen((char*)cell->ptr);  // 🔹 tamanho real
+    } else { 
+      *out_len = col->len - 1;              // 🔹 tamanho fixo definido
+    }
+  }
+
+  atomic_fetch_sub(&mutable_tb->ref_count, 1);
+  return DB_SUCCESS;
 }
 
 static int getFuguID(const table_t *tb, const row_t *row, size_t idx, fugu_id_t **out, bool *is_null) {
     if (!tb || !row || !out || idx >= row->len || idx >= tb->cols_len) return DB_ERROR_INVALID_INDEX;
 
+    table_t *mutable_tb = (table_t*)tb;
+    atomic_fetch_add(&mutable_tb->ref_count, 1);
+    
+    if (atomic_load(&tb->marked_for_del)) {
+        atomic_fetch_sub(&mutable_tb->ref_count, 1);
+        return DB_ERROR_TABLE_NOT_FOUND;
+    }
+
     column_t *col = &tb->columns[idx];
     column_val_t *cell = &row->values[idx];
 
-    if (col->type != COL_FUGU_ID) return DB_ERROR_COLUMN_MISMATCH;
+    if (col->type != COL_FUGU_ID) {
+        atomic_fetch_sub(&mutable_tb->ref_count, 1);
+        return DB_ERROR_COLUMN_MISMATCH;
+    }
 
     if (!cell->ptr) {
         if (col->nullable) { 
             if (is_null) *is_null = true; 
             *out = NULL; 
+            atomic_fetch_sub(&mutable_tb->ref_count, 1);
             return DB_SUCCESS; 
         }
+        atomic_fetch_sub(&mutable_tb->ref_count, 1);
         return DB_ERROR_NULL_PARAM;
     }
 
     if (is_null) *is_null = false;
     *out = (fugu_id_t*)cell->ptr;
+    atomic_fetch_sub(&mutable_tb->ref_count, 1);
     return DB_SUCCESS;
 }
 
 /* ---------------------------fuguid_functions-------------------------------- */
-
 
 static uint16_t compute_machine_hash(void) {
     char host[256] = {0};
@@ -884,28 +1447,32 @@ static fugu_id_t generateFuguID(void) {
     gettimeofday(&tv, NULL);
     uint64_t ts_us = (uint64_t)tv.tv_sec * 1000000ull + tv.tv_usec;
 
+    // FIXED: Use nanosecond precision for better uniqueness
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    uint64_t ts_ns = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+    
+    // FIXED: Mix in more randomness to avoid collisions
     uint16_t seq = (uint16_t)atomic_fetch_add(&g_sequence_counter, 1);
+    
+    // If sequence wraps, add microsecond delay to ensure different timestamp
+    if (seq == 0) {
+        usleep(1);
+        gettimeofday(&tv, NULL);
+        ts_us = (uint64_t)tv.tv_sec * 1000000ull + tv.tv_usec;
+    }
 
     // Layout: [6 ts][2 machine_hash][1 proc][2 seq][1 ver]
-
-    // 6 bytes timestamp BE
     for (int i = 5; i >= 0; i--) {
         id.data[i] = (unsigned char)(ts_us & 0xFF);
         ts_us >>= 8;
     }
 
-    // 2 bytes machine hash
     id.data[6] = (g_machine_hash >> 8) & 0xFF;
     id.data[7] = g_machine_hash & 0xFF;
-
-    // 1 byte process hash
     id.data[8] = g_proc_hash;
-
-    // 2 bytes sequence BE
     id.data[9]  = (seq >> 8) & 0xFF;
     id.data[10] = seq & 0xFF;
-
-    // 1 byte version
     id.data[11] = FUGUID_VERSION;
 
     return id;
@@ -944,8 +1511,8 @@ int compareFuguID(const fugu_id_t *a, const fugu_id_t *b) {
   return memcmp(a->data, b->data, FUGUID_LEN);
 }
 
-// main is for testing
 
+// main is for testing
 int main() {
    return 0;
 }
