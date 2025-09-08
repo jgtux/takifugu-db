@@ -1,6 +1,6 @@
 # takifugu-db
 
-Minimalist and secure db made in C made for OpenBSD (WIP)
+Minimalist and secure db made in C made with OpenBSD library (WIP)
 
 ```
        _____
@@ -27,7 +27,8 @@ Minimalist and secure db made in C made for OpenBSD (WIP)
 ----
 
 - Simple CRUD
-- Compact-UUID type
+- Binary payload
+- fugu-UUID type
 - ChaCha20-Poly1305 encrypted packet transmission 
 - Key based authentication
 - Lightweight protocol
